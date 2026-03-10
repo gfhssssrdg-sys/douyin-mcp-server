@@ -15,7 +15,7 @@
 ## ✨ 功能特性
 
 - 🎬 **无水印视频** - 获取高质量无水印视频下载链接
-- 🎙️ **AI 语音识别** - 使用硅基流动 SenseVoice 自动提取文案
+- 🎙️ **AI 语音识别** - 支持 DashScope / 硅基流动 与火山引擎 / 火山方舟 ASR 自动提取文案
 - 📑 **大文件支持** - 自动分段处理超过 1 小时或 50MB 的音频
 - 🌐 **WebUI** - 现代化浏览器界面，无需命令行
 - 🔌 **MCP 集成** - 支持 Claude Desktop 等 AI 应用
@@ -54,23 +54,38 @@ uv run python web/app.py
 
 ### 配置 API Key
 
-有两种方式配置 API Key：
+有两种方式配置 ASR：
 
 **方式一：浏览器内配置（推荐）**
 
 1. 打开 WebUI 页面
 2. 点击顶部的「API 未配置」按钮
-3. 在弹窗中输入 API Key 并保存
-4. API Key 保存在浏览器本地，刷新页面后仍有效
+3. 输入 API Key 并保存
+4. 配置保存在浏览器本地，刷新页面后仍有效；provider / model / base URL 建议通过环境变量配置
 
 **方式二：环境变量**
 
+### DashScope / 硅基流动
+
 ```bash
-export API_KEY="sk-xxxxxxxxxxxxxxxx"
+export ASR_PROVIDER="dashscope"
+export DASHSCOPE_API_KEY="sk-xxxxxxxxxxxxxxxx"
+# 可选：如果你走硅基流动兼容接口，也可以继续用 API_KEY
+# export API_KEY="sk-xxxxxxxxxxxxxxxx"
 uv run python web/app.py
 ```
 
-> 💡 获取免费 API Key：[硅基流动](https://cloud.siliconflow.cn/i/TxUlXG3u)（新用户有免费额度）
+### 火山引擎 / 火山方舟
+
+```bash
+export ASR_PROVIDER="volcengine"
+export ARK_API_KEY="your-ark-api-key"
+export ARK_BASE_URL="https://ark.cn-beijing.volces.com/api/v3"
+export ARK_ASR_MODEL="doubao-seed-asr-1-0"
+uv run python web/app.py
+```
+
+> 💡 DashScope / 硅基流动可参考：[硅基流动](https://cloud.siliconflow.cn/i/TxUlXG3u)
 
 ### 功能说明
 
@@ -96,7 +111,7 @@ uv run python web/app.py
 
 ### 配置方法
 
-编辑 MCP 配置文件，添加：
+#### DashScope / 硅基流动
 
 ```json
 {
@@ -105,7 +120,27 @@ uv run python web/app.py
       "command": "uvx",
       "args": ["douyin-mcp-server"],
       "env": {
-        "API_KEY": "sk-xxxxxxxxxxxxxxxx"
+        "ASR_PROVIDER": "dashscope",
+        "DASHSCOPE_API_KEY": "sk-xxxxxxxxxxxxxxxx"
+      }
+    }
+  }
+}
+```
+
+#### 火山引擎 / 火山方舟
+
+```json
+{
+  "mcpServers": {
+    "douyin-mcp": {
+      "command": "uvx",
+      "args": ["douyin-mcp-server"],
+      "env": {
+        "ASR_PROVIDER": "volcengine",
+        "ARK_API_KEY": "your-ark-api-key",
+        "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
+        "ARK_ASR_MODEL": "doubao-seed-asr-1-0"
       }
     }
   }
@@ -130,6 +165,34 @@ Claude：我来帮你提取视频文案...
 提取完成，文案内容如下：
 ...
 ```
+
+### 接入 Agent Reach
+
+如果你想把这个版本接入 Agent Reach，本质上就是把 `douyin-mcp-server` 作为一个 MCP server 注册给 Agent Reach / OpenClaw 使用。
+
+示例（火山引擎 / 方舟）：
+
+```json
+{
+  "mcpServers": {
+    "douyin-mcp": {
+      "command": "uvx",
+      "args": ["git+https://github.com/gfhssssrdg-sys/douyin-mcp-server.git@feat/volcengine-ark-asr"],
+      "env": {
+        "ASR_PROVIDER": "volcengine",
+        "ARK_API_KEY": "your-ark-api-key",
+        "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
+        "ARK_ASR_MODEL": "doubao-seed-asr-1-0"
+      }
+    }
+  }
+}
+```
+
+如果 Agent Reach 已经有自己的 MCP 配置入口，只要把以上 server 定义填进去即可；之后它就能继续调用：
+- `parse_douyin_video_info`
+- `get_douyin_download_link`
+- `extract_douyin_text`
 
 ---
 
@@ -157,8 +220,16 @@ uv run python douyin-video/scripts/douyin_downloader.py -l "分享链接" -a inf
 # 下载无水印视频
 uv run python douyin-video/scripts/douyin_downloader.py -l "分享链接" -a download -o ./videos
 
-# 提取文案（需要 API_KEY）
-export API_KEY="sk-xxx"
+# 使用 DashScope / 硅基流动提取文案
+export ASR_PROVIDER="dashscope"
+export DASHSCOPE_API_KEY="sk-xxx"
+uv run python douyin-video/scripts/douyin_downloader.py -l "分享链接" -a extract -o ./output
+
+# 使用火山引擎 / 火山方舟提取文案
+export ASR_PROVIDER="volcengine"
+export ARK_API_KEY="your-ark-api-key"
+export ARK_BASE_URL="https://ark.cn-beijing.volces.com/api/v3"
+export ARK_ASR_MODEL="doubao-seed-asr-1-0"
 uv run python douyin-video/scripts/douyin_downloader.py -l "分享链接" -a extract -o ./output
 
 # 提取文案并保存视频
@@ -217,11 +288,22 @@ output/
 
 ### API 说明
 
-语音识别使用 [硅基流动 SenseVoice API](https://cloud.siliconflow.cn/)：
+支持两类语音识别接入：
 
-- 模型：`FunAudioLLM/SenseVoiceSmall`
-- 限制：单次最大 1 小时 / 50MB（已自动处理）
-- 费用：新用户有免费额度
+#### 1) DashScope / 硅基流动
+- 默认 provider：`dashscope`
+- 常用模型：`FunAudioLLM/SenseVoiceSmall`（命令行）/ `paraformer-v2`（MCP 直连）
+- 典型环境变量：`DASHSCOPE_API_KEY`、`DASHSCOPE_ASR_MODEL`
+- 兼容保留：`API_KEY`
+
+#### 2) 火山引擎 / 火山方舟
+- provider：`volcengine`
+- 默认 Base URL：`https://ark.cn-beijing.volces.com/api/v3`
+- 默认模型：`doubao-seed-asr-1-0`
+- 典型环境变量：`ARK_API_KEY`、`ARK_BASE_URL`、`ARK_ASR_MODEL`
+- 兼容别名：`VOLCENGINE_API_KEY`、`VOLCENGINE_BASE_URL`
+
+> 注意：不同账号开通的 ASR 模型名可能不同，如控制台显示的模型 ID 与默认值不一致，请以你自己的模型 ID 为准。
 
 ---
 
@@ -241,6 +323,12 @@ output/
 ### v1.2.0
 
 - 🔄 API 升级
+
+### 当前开发分支（未发布）
+
+- ✨ 新增 `volcengine` provider，支持火山引擎 / 火山方舟 ASR
+- 🔧 新增 `ASR_PROVIDER`、`ARK_API_KEY`、`ARK_BASE_URL`、`ARK_ASR_MODEL` 等环境变量
+- 🧩 MCP / CLI / WebUI 配置说明同步更新
 
 ### v1.0.0
 
