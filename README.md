@@ -79,11 +79,14 @@ uv run python web/app.py
 
 ```bash
 export ASR_PROVIDER="volcengine"
-export ARK_API_KEY="your-ark-api-key"
-export ARK_BASE_URL="https://ark.cn-beijing.volces.com/api/v3"
-export ARK_ASR_MODEL="doubao-seed-asr-1-0"
+export ARK_API_KEY="your-volcengine-api-key"   # 实际以 x-api-key 发送
+export ARK_BASE_URL="https://openspeech.bytedance.com/api/v3"
+export VOLCENGINE_RESOURCE_ID="volc.seedasr.auc"  # 可选，默认值
+export ARK_ASR_MODEL="bigmodel"                   # 可选，默认值
 uv run python web/app.py
 ```
+
+> 注意：这里用的是豆包语音「大模型录音文件识别」接口，不是 Ark/OpenAI 兼容的 `/audio/transcriptions`。
 
 > 💡 DashScope / 硅基流动可参考：[硅基流动](https://cloud.siliconflow.cn/i/TxUlXG3u)
 
@@ -138,9 +141,10 @@ uv run python web/app.py
       "args": ["douyin-mcp-server"],
       "env": {
         "ASR_PROVIDER": "volcengine",
-        "ARK_API_KEY": "your-ark-api-key",
-        "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
-        "ARK_ASR_MODEL": "doubao-seed-asr-1-0"
+        "ARK_API_KEY": "your-volcengine-api-key",
+        "ARK_BASE_URL": "https://openspeech.bytedance.com/api/v3",
+        "VOLCENGINE_RESOURCE_ID": "volc.seedasr.auc",
+        "ARK_ASR_MODEL": "bigmodel"
       }
     }
   }
@@ -180,9 +184,10 @@ Claude：我来帮你提取视频文案...
       "args": ["git+https://github.com/gfhssssrdg-sys/douyin-mcp-server.git@feat/volcengine-ark-asr"],
       "env": {
         "ASR_PROVIDER": "volcengine",
-        "ARK_API_KEY": "your-ark-api-key",
-        "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
-        "ARK_ASR_MODEL": "doubao-seed-asr-1-0"
+        "ARK_API_KEY": "your-volcengine-api-key",
+        "ARK_BASE_URL": "https://openspeech.bytedance.com/api/v3",
+        "VOLCENGINE_RESOURCE_ID": "volc.seedasr.auc",
+        "ARK_ASR_MODEL": "bigmodel"
       }
     }
   }
@@ -227,9 +232,10 @@ uv run python douyin-video/scripts/douyin_downloader.py -l "分享链接" -a ext
 
 # 使用火山引擎 / 火山方舟提取文案
 export ASR_PROVIDER="volcengine"
-export ARK_API_KEY="your-ark-api-key"
-export ARK_BASE_URL="https://ark.cn-beijing.volces.com/api/v3"
-export ARK_ASR_MODEL="doubao-seed-asr-1-0"
+export ARK_API_KEY="your-volcengine-api-key"   # 实际以 x-api-key 发送
+export ARK_BASE_URL="https://openspeech.bytedance.com/api/v3"
+export VOLCENGINE_RESOURCE_ID="volc.seedasr.auc"
+export ARK_ASR_MODEL="bigmodel"
 uv run python douyin-video/scripts/douyin_downloader.py -l "分享链接" -a extract -o ./output
 
 # 提取文案并保存视频
@@ -298,12 +304,15 @@ output/
 
 #### 2) 火山引擎 / 火山方舟
 - provider：`volcengine`
-- 默认 Base URL：`https://ark.cn-beijing.volces.com/api/v3`
-- 默认模型：`doubao-seed-asr-1-0`
-- 典型环境变量：`ARK_API_KEY`、`ARK_BASE_URL`、`ARK_ASR_MODEL`
-- 兼容别名：`VOLCENGINE_API_KEY`、`VOLCENGINE_BASE_URL`
+- 真实接口：`POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit` + `POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/query`
+- 认证方式：请求头 `x-api-key: <你的 API Key>`
+- 默认 Base URL：`https://openspeech.bytedance.com/api/v3`
+- 默认模型：`bigmodel`
+- 默认资源 ID：`volc.seedasr.auc`
+- 典型环境变量：`ARK_API_KEY`、`ARK_BASE_URL`、`VOLCENGINE_RESOURCE_ID`、`ARK_ASR_MODEL`
+- 兼容别名：`VOLCENGINE_API_KEY`、`VOLCENGINE_SPEECH_API_KEY`、`VOLCENGINE_BASE_URL`
 
-> 注意：不同账号开通的 ASR 模型名可能不同，如控制台显示的模型 ID 与默认值不一致，请以你自己的模型 ID 为准。
+> 注意：这里不是 Ark 的 OpenAI `/audio/transcriptions`。`ARK_API_KEY` 只是沿用旧变量名，代码里实际会把它作为豆包语音的 `x-api-key` 发送。
 
 ---
 
@@ -326,8 +335,8 @@ output/
 
 ### 当前开发分支（未发布）
 
-- ✨ 新增 `volcengine` provider，支持火山引擎 / 火山方舟 ASR
-- 🔧 新增 `ASR_PROVIDER`、`ARK_API_KEY`、`ARK_BASE_URL`、`ARK_ASR_MODEL` 等环境变量
+- ✨ 新增 `volcengine` provider，接入豆包语音「大模型录音文件识别」提交/查询接口
+- 🔧 新增 `ASR_PROVIDER`、`ARK_API_KEY`、`ARK_BASE_URL`、`VOLCENGINE_RESOURCE_ID`、`ARK_ASR_MODEL` 等环境变量
 - 🧩 MCP / CLI / WebUI 配置说明同步更新
 
 ### v1.0.0

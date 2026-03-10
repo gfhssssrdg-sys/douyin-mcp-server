@@ -11,6 +11,8 @@
 import json
 import os
 import re
+import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -34,8 +36,11 @@ HEADERS = {
 
 DEFAULT_PROVIDER = "dashscope"
 DEFAULT_DASHSCOPE_MODEL = "paraformer-v2"
-DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-DEFAULT_ARK_MODEL = "doubao-seed-asr-1-0"
+DEFAULT_ARK_BASE_URL = "https://openspeech.bytedance.com/api/v3"
+DEFAULT_ARK_MODEL = "bigmodel"
+DEFAULT_VOLCENGINE_RESOURCE_ID = "volc.seedasr.auc"
+DEFAULT_VOLCENGINE_POLL_INTERVAL = 2
+DEFAULT_VOLCENGINE_POLL_TIMEOUT = 300
 
 
 class DouyinProcessor:
@@ -47,11 +52,13 @@ class DouyinProcessor:
         model: Optional[str] = None,
         provider: Optional[str] = None,
         api_base_url: Optional[str] = None,
+        resource_id: Optional[str] = None,
     ):
         self.api_key = api_key
         self.provider = (provider or DEFAULT_PROVIDER).lower()
         self.model = model or self._default_model(self.provider)
         self.api_base_url = api_base_url or self._default_base_url(self.provider)
+        self.resource_id = resource_id or DEFAULT_VOLCENGINE_RESOURCE_ID
         if self.provider == "dashscope" and api_key:
             dashscope.api_key = api_key
 
@@ -130,21 +137,82 @@ class DouyinProcessor:
             raise Exception(f"DashScope 转录失败: {str(e)}")
 
     def _extract_text_volcengine(self, video_url: str) -> str:
-        endpoint = f"{self.api_base_url.rstrip('/')}/audio/transcriptions"
-        headers = {"Authorization": f"Bearer {self.api_key}"}
-        data = {"model": self.model, "file_url": video_url}
+        submit_endpoint = f"{self.api_base_url.rstrip('/')}/auc/bigmodel/submit"
+        query_endpoint = f"{self.api_base_url.rstrip('/')}/auc/bigmodel/query"
+        request_id = str(uuid.uuid4())
+        headers = {
+            "Content-Type": "application/json",
+            "X-Api-Key": self.api_key,
+            "X-Api-Resource-Id": self.resource_id,
+            "X-Api-Request-Id": request_id,
+            "X-Api-Sequence": "-1",
+        }
+        payload = {
+            "user": {"uid": "douyin-mcp-server"},
+            "audio": {
+                "url": video_url,
+                "format": "mp4",
+            },
+            "request": {
+                "model_name": self.model,
+                "enable_itn": True,
+                "enable_punc": True,
+            },
+        }
 
         try:
-            response = requests.post(endpoint, headers=headers, data=data, timeout=300)
-            response.raise_for_status()
-            result = response.json()
+            submit_response = requests.post(submit_endpoint, headers=headers, json=payload, timeout=60)
+            submit_response.raise_for_status()
         except Exception as e:
-            raise Exception(f"火山引擎 / 方舟转录失败: {str(e)}")
+            raise Exception(f"火山引擎 / 方舟提交转录任务失败: {str(e)}")
 
-        text = result.get("text") or result.get("result") or result.get("transcript")
-        if text:
-            return text
-        return json.dumps(result, ensure_ascii=False)
+        submit_code = submit_response.headers.get("X-Api-Status-Code")
+        submit_message = submit_response.headers.get("X-Api-Message", "")
+        if submit_code != "20000000":
+            raise Exception(f"火山引擎 / 方舟提交转录任务失败: code={submit_code}, message={submit_message or 'unknown'}")
+
+        deadline = time.time() + DEFAULT_VOLCENGINE_POLL_TIMEOUT
+        while time.time() < deadline:
+            try:
+                query_response = requests.post(query_endpoint, headers={k: v for k, v in headers.items() if k != "X-Api-Sequence"}, json={}, timeout=60)
+                query_response.raise_for_status()
+                query_result = query_response.json()
+            except Exception as e:
+                raise Exception(f"火山引擎 / 方舟查询转录结果失败: {str(e)}")
+
+            query_code = query_response.headers.get("X-Api-Status-Code")
+            query_message = query_response.headers.get("X-Api-Message", "")
+            if query_code == "20000000":
+                text = self._parse_volcengine_result(query_result)
+                if text:
+                    return text
+                return json.dumps(query_result, ensure_ascii=False)
+            if query_code in {"20000001", "20000002"}:
+                time.sleep(DEFAULT_VOLCENGINE_POLL_INTERVAL)
+                continue
+            raise Exception(f"火山引擎 / 方舟转录失败: code={query_code}, message={query_message or 'unknown'}")
+
+        raise TimeoutError(f"火山引擎 / 方舟转录查询超时（>{DEFAULT_VOLCENGINE_POLL_TIMEOUT}s）")
+
+    @staticmethod
+    def _parse_volcengine_result(result: dict) -> str:
+        parsed = result.get("result")
+        if isinstance(parsed, dict):
+            text = parsed.get("text")
+            if text:
+                return text
+            utterances = parsed.get("utterances") or []
+            utterance_text = "".join(item.get("text", "") for item in utterances if isinstance(item, dict))
+            if utterance_text:
+                return utterance_text
+        if isinstance(parsed, list):
+            combined = []
+            for item in parsed:
+                if isinstance(item, dict) and item.get("text"):
+                    combined.append(item["text"])
+            if combined:
+                return "\n".join(combined)
+        return result.get("text") or result.get("transcript") or ""
 
 
 def resolve_runtime_config(provider: Optional[str], model: Optional[str], api_base_url: Optional[str]) -> dict:
@@ -154,21 +222,25 @@ def resolve_runtime_config(provider: Optional[str], model: Optional[str], api_ba
         resolved_api_key = (
             os.getenv("ARK_API_KEY")
             or os.getenv("VOLCENGINE_API_KEY")
+            or os.getenv("VOLCENGINE_SPEECH_API_KEY")
             or os.getenv("API_KEY")
         )
         resolved_model = model or os.getenv("ARK_ASR_MODEL") or os.getenv("ARK_MODEL") or os.getenv("VOLCENGINE_ASR_MODEL") or DEFAULT_ARK_MODEL
         resolved_base_url = api_base_url or os.getenv("ARK_BASE_URL") or os.getenv("VOLCENGINE_BASE_URL") or DEFAULT_ARK_BASE_URL
+        resolved_resource_id = os.getenv("VOLCENGINE_RESOURCE_ID") or DEFAULT_VOLCENGINE_RESOURCE_ID
     else:
         resolved_provider = "dashscope"
         resolved_api_key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("API_KEY")
         resolved_model = model or os.getenv("DASHSCOPE_ASR_MODEL") or os.getenv("DASHSCOPE_MODEL") or DEFAULT_DASHSCOPE_MODEL
         resolved_base_url = api_base_url
+        resolved_resource_id = None
 
     return {
         "provider": resolved_provider,
         "api_key": resolved_api_key,
         "model": resolved_model,
         "api_base_url": resolved_base_url,
+        "resource_id": resolved_resource_id,
     }
 
 
@@ -277,7 +349,7 @@ def douyin_text_extraction_guide() -> str:
 
 ## 支持的 ASR Provider
 - `dashscope`（默认）
-- `volcengine`（火山引擎 / 火山方舟，OpenAI-compatible Audio Transcriptions）
+- `volcengine`（火山引擎 / 豆包语音 API Key + 大模型录音文件识别接口）
 
 ## 环境变量配置
 ### DashScope
@@ -287,9 +359,10 @@ def douyin_text_extraction_guide() -> str:
 
 ### 火山引擎 / 火山方舟
 - `ASR_PROVIDER=volcengine`
-- `ARK_API_KEY` 或 `VOLCENGINE_API_KEY`
+- `ARK_API_KEY` / `VOLCENGINE_API_KEY` / `VOLCENGINE_SPEECH_API_KEY`（实际作为 `x-api-key` 发送）
 - `ARK_BASE_URL`（默认 `{DEFAULT_ARK_BASE_URL}`）
-- `ARK_ASR_MODEL` / `ARK_MODEL`（默认 `{DEFAULT_ARK_MODEL}`）
+- `VOLCENGINE_RESOURCE_ID`（默认 `{DEFAULT_VOLCENGINE_RESOURCE_ID}`）
+- `ARK_ASR_MODEL` / `ARK_MODEL`（默认 `{DEFAULT_ARK_MODEL}`，通常保持 `bigmodel`）
 
 ## Claude Desktop 配置示例
 ### DashScope
@@ -317,8 +390,9 @@ def douyin_text_extraction_guide() -> str:
       "args": ["douyin-mcp-server"],
       "env": {{
         "ASR_PROVIDER": "volcengine",
-        "ARK_API_KEY": "your-ark-key",
+        "ARK_API_KEY": "your-volcengine-api-key",
         "ARK_BASE_URL": "{DEFAULT_ARK_BASE_URL}",
+        "VOLCENGINE_RESOURCE_ID": "{DEFAULT_VOLCENGINE_RESOURCE_ID}",
         "ARK_ASR_MODEL": "{DEFAULT_ARK_MODEL}"
       }}
     }}
