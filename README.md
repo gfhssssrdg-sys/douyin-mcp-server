@@ -15,7 +15,7 @@
 ## ✨ 功能特性
 
 - 🎬 **无水印视频** - 获取高质量无水印视频下载链接
-- 🎙️ **AI 语音识别** - 使用硅基流动 SenseVoice 自动提取文案
+- 🎙️ **AI 语音识别** - 支持 DashScope / 硅基流动 与火山引擎 / 火山方舟 ASR 自动提取文案
 - 📑 **大文件支持** - 自动分段处理超过 1 小时或 50MB 的音频
 - 🌐 **WebUI** - 现代化浏览器界面，无需命令行
 - 🔌 **MCP 集成** - 支持 Claude Desktop 等 AI 应用
@@ -54,23 +54,41 @@ uv run python web/app.py
 
 ### 配置 API Key
 
-有两种方式配置 API Key：
+有两种方式配置 ASR：
 
 **方式一：浏览器内配置（推荐）**
 
 1. 打开 WebUI 页面
 2. 点击顶部的「API 未配置」按钮
-3. 在弹窗中输入 API Key 并保存
-4. API Key 保存在浏览器本地，刷新页面后仍有效
+3. 输入 API Key 并保存
+4. 配置保存在浏览器本地，刷新页面后仍有效；provider / model / base URL 建议通过环境变量配置
 
 **方式二：环境变量**
 
+### DashScope / 硅基流动
+
 ```bash
-export API_KEY="sk-xxxxxxxxxxxxxxxx"
+export ASR_PROVIDER="dashscope"
+export DASHSCOPE_API_KEY="sk-xxxxxxxxxxxxxxxx"
+# 可选：如果你走硅基流动兼容接口，也可以继续用 API_KEY
+# export API_KEY="sk-xxxxxxxxxxxxxxxx"
 uv run python web/app.py
 ```
 
-> 💡 获取免费 API Key：[硅基流动](https://cloud.siliconflow.cn/i/TxUlXG3u)（新用户有免费额度）
+### 火山引擎 / 火山方舟
+
+```bash
+export ASR_PROVIDER="volcengine"
+export ARK_API_KEY="your-volcengine-api-key"   # 实际以 x-api-key 发送
+export ARK_BASE_URL="https://openspeech.bytedance.com/api/v3"
+export VOLCENGINE_RESOURCE_ID="volc.seedasr.auc"  # 可选，默认值
+export ARK_ASR_MODEL="bigmodel"                   # 可选，默认值
+uv run python web/app.py
+```
+
+> 注意：这里用的是豆包语音「大模型录音文件识别」接口，不是 Ark/OpenAI 兼容的 `/audio/transcriptions`。
+
+> 💡 DashScope / 硅基流动可参考：[硅基流动](https://cloud.siliconflow.cn/i/TxUlXG3u)
 
 ### 功能说明
 
@@ -96,7 +114,7 @@ uv run python web/app.py
 
 ### 配置方法
 
-编辑 MCP 配置文件，添加：
+#### DashScope / 硅基流动
 
 ```json
 {
@@ -105,7 +123,28 @@ uv run python web/app.py
       "command": "uvx",
       "args": ["douyin-mcp-server"],
       "env": {
-        "API_KEY": "sk-xxxxxxxxxxxxxxxx"
+        "ASR_PROVIDER": "dashscope",
+        "DASHSCOPE_API_KEY": "sk-xxxxxxxxxxxxxxxx"
+      }
+    }
+  }
+}
+```
+
+#### 火山引擎 / 火山方舟
+
+```json
+{
+  "mcpServers": {
+    "douyin-mcp": {
+      "command": "uvx",
+      "args": ["douyin-mcp-server"],
+      "env": {
+        "ASR_PROVIDER": "volcengine",
+        "ARK_API_KEY": "your-volcengine-api-key",
+        "ARK_BASE_URL": "https://openspeech.bytedance.com/api/v3",
+        "VOLCENGINE_RESOURCE_ID": "volc.seedasr.auc",
+        "ARK_ASR_MODEL": "bigmodel"
       }
     }
   }
@@ -130,6 +169,35 @@ Claude：我来帮你提取视频文案...
 提取完成，文案内容如下：
 ...
 ```
+
+### 接入 Agent Reach
+
+如果你想把这个版本接入 Agent Reach，本质上就是把 `douyin-mcp-server` 作为一个 MCP server 注册给 Agent Reach / OpenClaw 使用。
+
+示例（火山引擎 / 方舟）：
+
+```json
+{
+  "mcpServers": {
+    "douyin-mcp": {
+      "command": "uvx",
+      "args": ["git+https://github.com/gfhssssrdg-sys/douyin-mcp-server.git@feat/volcengine-ark-asr"],
+      "env": {
+        "ASR_PROVIDER": "volcengine",
+        "ARK_API_KEY": "your-volcengine-api-key",
+        "ARK_BASE_URL": "https://openspeech.bytedance.com/api/v3",
+        "VOLCENGINE_RESOURCE_ID": "volc.seedasr.auc",
+        "ARK_ASR_MODEL": "bigmodel"
+      }
+    }
+  }
+}
+```
+
+如果 Agent Reach 已经有自己的 MCP 配置入口，只要把以上 server 定义填进去即可；之后它就能继续调用：
+- `parse_douyin_video_info`
+- `get_douyin_download_link`
+- `extract_douyin_text`
 
 ---
 
@@ -157,8 +225,17 @@ uv run python douyin-video/scripts/douyin_downloader.py -l "分享链接" -a inf
 # 下载无水印视频
 uv run python douyin-video/scripts/douyin_downloader.py -l "分享链接" -a download -o ./videos
 
-# 提取文案（需要 API_KEY）
-export API_KEY="sk-xxx"
+# 使用 DashScope / 硅基流动提取文案
+export ASR_PROVIDER="dashscope"
+export DASHSCOPE_API_KEY="sk-xxx"
+uv run python douyin-video/scripts/douyin_downloader.py -l "分享链接" -a extract -o ./output
+
+# 使用火山引擎 / 火山方舟提取文案
+export ASR_PROVIDER="volcengine"
+export ARK_API_KEY="your-volcengine-api-key"   # 实际以 x-api-key 发送
+export ARK_BASE_URL="https://openspeech.bytedance.com/api/v3"
+export VOLCENGINE_RESOURCE_ID="volc.seedasr.auc"
+export ARK_ASR_MODEL="bigmodel"
 uv run python douyin-video/scripts/douyin_downloader.py -l "分享链接" -a extract -o ./output
 
 # 提取文案并保存视频
@@ -217,11 +294,25 @@ output/
 
 ### API 说明
 
-语音识别使用 [硅基流动 SenseVoice API](https://cloud.siliconflow.cn/)：
+支持两类语音识别接入：
 
-- 模型：`FunAudioLLM/SenseVoiceSmall`
-- 限制：单次最大 1 小时 / 50MB（已自动处理）
-- 费用：新用户有免费额度
+#### 1) DashScope / 硅基流动
+- 默认 provider：`dashscope`
+- 常用模型：`FunAudioLLM/SenseVoiceSmall`（命令行）/ `paraformer-v2`（MCP 直连）
+- 典型环境变量：`DASHSCOPE_API_KEY`、`DASHSCOPE_ASR_MODEL`
+- 兼容保留：`API_KEY`
+
+#### 2) 火山引擎 / 火山方舟
+- provider：`volcengine`
+- 真实接口：`POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit` + `POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/query`
+- 认证方式：请求头 `x-api-key: <你的 API Key>`
+- 默认 Base URL：`https://openspeech.bytedance.com/api/v3`
+- 默认模型：`bigmodel`
+- 默认资源 ID：`volc.seedasr.auc`
+- 典型环境变量：`ARK_API_KEY`、`ARK_BASE_URL`、`VOLCENGINE_RESOURCE_ID`、`ARK_ASR_MODEL`
+- 兼容别名：`VOLCENGINE_API_KEY`、`VOLCENGINE_SPEECH_API_KEY`、`VOLCENGINE_BASE_URL`
+
+> 注意：这里不是 Ark 的 OpenAI `/audio/transcriptions`。`ARK_API_KEY` 只是沿用旧变量名，代码里实际会把它作为豆包语音的 `x-api-key` 发送。
 
 ---
 
@@ -241,6 +332,12 @@ output/
 ### v1.2.0
 
 - 🔄 API 升级
+
+### 当前开发分支（未发布）
+
+- ✨ 新增 `volcengine` provider，接入豆包语音「大模型录音文件识别」提交/查询接口
+- 🔧 新增 `ASR_PROVIDER`、`ARK_API_KEY`、`ARK_BASE_URL`、`VOLCENGINE_RESOURCE_ID`、`ARK_ASR_MODEL` 等环境变量
+- 🧩 MCP / CLI / WebUI 配置说明同步更新
 
 ### v1.0.0
 

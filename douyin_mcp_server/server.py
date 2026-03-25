@@ -2,315 +2,339 @@
 """
 抖音无水印视频下载并提取文本的 MCP 服务器
 
-该服务器提供以下功能：
+支持：
 1. 解析抖音分享链接获取无水印视频链接
-2. 下载视频并提取音频
-3. 从音频中提取文本内容
-4. 自动清理中间文件
+2. 直接返回无水印下载链接
+3. 使用 DashScope 或火山引擎 / 火山方舟 ASR 提取文案
 """
 
+import json
 import os
 import re
-import json
-import requests
-import tempfile
-import asyncio
+import time
+import uuid
 from pathlib import Path
-from typing import Optional, Tuple
-import ffmpeg
-from tqdm.asyncio import tqdm
-from urllib import request
-from http import HTTPStatus
+from typing import Optional
+
 import dashscope
+import requests
+from http import HTTPStatus
+from urllib import request
 
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp import Context
-
+from mcp.server.fastmcp import Context, FastMCP
 
 # 创建 MCP 服务器实例
-mcp = FastMCP("Douyin MCP Server", 
-              dependencies=["requests", "ffmpeg-python", "tqdm", "dashscope"])
+mcp = FastMCP(
+    "Douyin MCP Server",
+    dependencies=["requests", "dashscope"],
+)
 
 # 请求头，模拟移动端访问
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) EdgiOS/121.0.2277.107 Version/17.0 Mobile/15E148 Safari/604.1'
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) EdgiOS/121.0.2277.107 Version/17.0 Mobile/15E148 Safari/604.1"
 }
 
-# 默认 API 配置
-DEFAULT_MODEL = "paraformer-v2"
+DEFAULT_PROVIDER = "dashscope"
+DEFAULT_DASHSCOPE_MODEL = "paraformer-v2"
+DEFAULT_ARK_BASE_URL = "https://openspeech.bytedance.com/api/v3"
+DEFAULT_ARK_MODEL = "bigmodel"
+DEFAULT_VOLCENGINE_RESOURCE_ID = "volc.seedasr.auc"
+DEFAULT_VOLCENGINE_POLL_INTERVAL = 2
+DEFAULT_VOLCENGINE_POLL_TIMEOUT = 300
 
 
 class DouyinProcessor:
     """抖音视频处理器"""
-    
-    def __init__(self, api_key: str, model: Optional[str] = None):
+
+    def __init__(
+        self,
+        api_key: str = "",
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        api_base_url: Optional[str] = None,
+        resource_id: Optional[str] = None,
+    ):
         self.api_key = api_key
-        self.model = model or DEFAULT_MODEL
-        self.temp_dir = Path(tempfile.mkdtemp())
-        # 设置阿里云百炼API密钥
-        dashscope.api_key = api_key
-    
-    def __del__(self):
-        """清理临时目录"""
-        import shutil
-        if hasattr(self, 'temp_dir') and self.temp_dir.exists():
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
-    
+        self.provider = (provider or DEFAULT_PROVIDER).lower()
+        self.model = model or self._default_model(self.provider)
+        self.api_base_url = api_base_url or self._default_base_url(self.provider)
+        self.resource_id = resource_id or DEFAULT_VOLCENGINE_RESOURCE_ID
+        if self.provider == "dashscope" and api_key:
+            dashscope.api_key = api_key
+
+    @staticmethod
+    def _default_model(provider: str) -> str:
+        return DEFAULT_ARK_MODEL if provider == "volcengine" else DEFAULT_DASHSCOPE_MODEL
+
+    @staticmethod
+    def _default_base_url(provider: str) -> Optional[str]:
+        return DEFAULT_ARK_BASE_URL if provider == "volcengine" else None
+
     def parse_share_url(self, share_text: str) -> dict:
         """从分享文本中提取无水印视频链接"""
-        # 提取分享链接
-        urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', share_text)
+        urls = re.findall(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+", share_text)
         if not urls:
             raise ValueError("未找到有效的分享链接")
-        
+
         share_url = urls[0]
         share_response = requests.get(share_url, headers=HEADERS)
         video_id = share_response.url.split("?")[0].strip("/").split("/")[-1]
-        share_url = f'https://www.iesdouyin.com/share/video/{video_id}'
-        
-        # 获取视频页面内容
+        share_url = f"https://www.iesdouyin.com/share/video/{video_id}"
+
         response = requests.get(share_url, headers=HEADERS)
         response.raise_for_status()
-        
-        pattern = re.compile(
-            pattern=r"window\._ROUTER_DATA\s*=\s*(.*?)</script>",
-            flags=re.DOTALL,
-        )
+
+        pattern = re.compile(pattern=r"window\._ROUTER_DATA\s*=\s*(.*?)</script>", flags=re.DOTALL)
         find_res = pattern.search(response.text)
 
         if not find_res or not find_res.group(1):
             raise ValueError("从HTML中解析视频信息失败")
 
-        # 解析JSON数据
         json_data = json.loads(find_res.group(1).strip())
-        VIDEO_ID_PAGE_KEY = "video_(id)/page"
-        NOTE_ID_PAGE_KEY = "note_(id)/page"
-        
-        if VIDEO_ID_PAGE_KEY in json_data["loaderData"]:
-            original_video_info = json_data["loaderData"][VIDEO_ID_PAGE_KEY]["videoInfoRes"]
-        elif NOTE_ID_PAGE_KEY in json_data["loaderData"]:
-            original_video_info = json_data["loaderData"][NOTE_ID_PAGE_KEY]["videoInfoRes"]
+        video_page_key = "video_(id)/page"
+        note_page_key = "note_(id)/page"
+
+        if video_page_key in json_data["loaderData"]:
+            original_video_info = json_data["loaderData"][video_page_key]["videoInfoRes"]
+        elif note_page_key in json_data["loaderData"]:
+            original_video_info = json_data["loaderData"][note_page_key]["videoInfoRes"]
         else:
             raise Exception("无法从JSON中解析视频或图集信息")
 
         data = original_video_info["item_list"][0]
-
-        # 获取视频信息
         video_url = data["video"]["play_addr"]["url_list"][0].replace("playwm", "play")
         desc = data.get("desc", "").strip() or f"douyin_{video_id}"
-        
-        # 替换文件名中的非法字符
-        desc = re.sub(r'[\\/:*?"<>|]', '_', desc)
-        
-        return {
-            "url": video_url,
-            "title": desc,
-            "video_id": video_id
-        }
-    
-    async def download_video(self, video_info: dict, ctx: Context) -> Path:
-        """异步下载视频到临时目录"""
-        filename = f"{video_info['video_id']}.mp4"
-        filepath = self.temp_dir / filename
-        
-        ctx.info(f"正在下载视频: {video_info['title']}")
-        
-        response = requests.get(video_info['url'], headers=HEADERS, stream=True)
-        response.raise_for_status()
-        
-        # 获取文件大小
-        total_size = int(response.headers.get('content-length', 0))
-        
-        # 异步下载文件，显示进度
-        with open(filepath, 'wb') as f:
-            downloaded = 0
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0:
-                        progress = downloaded / total_size
-                        await ctx.report_progress(downloaded, total_size)
-        
-        ctx.info(f"视频下载完成: {filepath}")
-        return filepath
-    
-    def extract_audio(self, video_path: Path) -> Path:
-        """从视频文件中提取音频"""
-        audio_path = video_path.with_suffix('.mp3')
-        
-        try:
-            (
-                ffmpeg
-                .input(str(video_path))
-                .output(str(audio_path), acodec='libmp3lame', q=0)
-                .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
-            )
-            return audio_path
-        except Exception as e:
-            raise Exception(f"提取音频时出错: {str(e)}")
-    
+        desc = re.sub(r'[\\/:*?"<>|]', "_", desc)
+
+        return {"url": video_url, "title": desc, "video_id": video_id}
+
     def extract_text_from_video_url(self, video_url: str) -> str:
-        """从视频URL中提取文字（使用阿里云百炼API）"""
+        if self.provider == "dashscope":
+            return self._extract_text_dashscope(video_url)
+        if self.provider == "volcengine":
+            return self._extract_text_volcengine(video_url)
+        raise ValueError(f"不支持的 provider: {self.provider}，可选值: dashscope / volcengine")
+
+    def _extract_text_dashscope(self, video_url: str) -> str:
         try:
-            # 发起异步转录任务
             task_response = dashscope.audio.asr.Transcription.async_call(
                 model=self.model,
                 file_urls=[video_url],
-                language_hints=['zh', 'en']
+                language_hints=["zh", "en"],
             )
-            
-            # 等待转录完成
-            transcription_response = dashscope.audio.asr.Transcription.wait(
-                task=task_response.output.task_id
-            )
-            
-            if transcription_response.status_code == HTTPStatus.OK:
-                # 获取转录结果
-                for transcription in transcription_response.output['results']:
-                    url = transcription['transcription_url']
-                    result = json.loads(request.urlopen(url).read().decode('utf8'))
-                    
-                    # 保存结果到临时文件
-                    temp_json_path = self.temp_dir / 'transcription.json'
-                    with open(temp_json_path, 'w') as f:
-                        json.dump(result, f, indent=4, ensure_ascii=False)
-                    
-                    # 提取文本内容
-                    if 'transcripts' in result and len(result['transcripts']) > 0:
-                        return result['transcripts'][0]['text']
-                    else:
-                        return "未识别到文本内容"
-                        
-            else:
-                raise Exception(f"转录失败: {transcription_response.output.message}")
-                
+            transcription_response = dashscope.audio.asr.Transcription.wait(task=task_response.output.task_id)
+
+            if transcription_response.status_code != HTTPStatus.OK:
+                raise Exception(transcription_response.output.message)
+
+            for transcription in transcription_response.output["results"]:
+                url = transcription["transcription_url"]
+                result = json.loads(request.urlopen(url).read().decode("utf8"))
+                if result.get("transcripts"):
+                    return result["transcripts"][0].get("text", "") or "未识别到文本内容"
+            return "未识别到文本内容"
         except Exception as e:
-            raise Exception(f"提取文字时出错: {str(e)}")
-    
-    def cleanup_files(self, *file_paths: Path):
-        """清理指定的文件"""
-        for file_path in file_paths:
-            if file_path.exists():
-                file_path.unlink()
+            raise Exception(f"DashScope 转录失败: {str(e)}")
+
+    def _extract_text_volcengine(self, video_url: str) -> str:
+        submit_endpoint = f"{self.api_base_url.rstrip('/')}/auc/bigmodel/submit"
+        query_endpoint = f"{self.api_base_url.rstrip('/')}/auc/bigmodel/query"
+        request_id = str(uuid.uuid4())
+        headers = {
+            "Content-Type": "application/json",
+            "X-Api-Key": self.api_key,
+            "X-Api-Resource-Id": self.resource_id,
+            "X-Api-Request-Id": request_id,
+            "X-Api-Sequence": "-1",
+        }
+        payload = {
+            "user": {"uid": "douyin-mcp-server"},
+            "audio": {
+                "url": video_url,
+                "format": "mp4",
+            },
+            "request": {
+                "model_name": self.model,
+                "enable_itn": True,
+                "enable_punc": True,
+            },
+        }
+
+        try:
+            submit_response = requests.post(submit_endpoint, headers=headers, json=payload, timeout=60)
+            submit_response.raise_for_status()
+        except Exception as e:
+            raise Exception(f"火山引擎 / 方舟提交转录任务失败: {str(e)}")
+
+        submit_code = submit_response.headers.get("X-Api-Status-Code")
+        submit_message = submit_response.headers.get("X-Api-Message", "")
+        if submit_code != "20000000":
+            raise Exception(f"火山引擎 / 方舟提交转录任务失败: code={submit_code}, message={submit_message or 'unknown'}")
+
+        deadline = time.time() + DEFAULT_VOLCENGINE_POLL_TIMEOUT
+        while time.time() < deadline:
+            try:
+                query_response = requests.post(query_endpoint, headers={k: v for k, v in headers.items() if k != "X-Api-Sequence"}, json={}, timeout=60)
+                query_response.raise_for_status()
+                query_result = query_response.json()
+            except Exception as e:
+                raise Exception(f"火山引擎 / 方舟查询转录结果失败: {str(e)}")
+
+            query_code = query_response.headers.get("X-Api-Status-Code")
+            query_message = query_response.headers.get("X-Api-Message", "")
+            if query_code == "20000000":
+                text = self._parse_volcengine_result(query_result)
+                if text:
+                    return text
+                return json.dumps(query_result, ensure_ascii=False)
+            if query_code in {"20000001", "20000002"}:
+                time.sleep(DEFAULT_VOLCENGINE_POLL_INTERVAL)
+                continue
+            raise Exception(f"火山引擎 / 方舟转录失败: code={query_code}, message={query_message or 'unknown'}")
+
+        raise TimeoutError(f"火山引擎 / 方舟转录查询超时（>{DEFAULT_VOLCENGINE_POLL_TIMEOUT}s）")
+
+    @staticmethod
+    def _parse_volcengine_result(result: dict) -> str:
+        parsed = result.get("result")
+        if isinstance(parsed, dict):
+            text = parsed.get("text")
+            if text:
+                return text
+            utterances = parsed.get("utterances") or []
+            utterance_text = "".join(item.get("text", "") for item in utterances if isinstance(item, dict))
+            if utterance_text:
+                return utterance_text
+        if isinstance(parsed, list):
+            combined = []
+            for item in parsed:
+                if isinstance(item, dict) and item.get("text"):
+                    combined.append(item["text"])
+            if combined:
+                return "\n".join(combined)
+        return result.get("text") or result.get("transcript") or ""
+
+
+def resolve_runtime_config(provider: Optional[str], model: Optional[str], api_base_url: Optional[str]) -> dict:
+    resolved_provider = (provider or os.getenv("ASR_PROVIDER") or os.getenv("TRANSCRIPTION_PROVIDER") or DEFAULT_PROVIDER).lower()
+
+    if resolved_provider == "volcengine":
+        resolved_api_key = (
+            os.getenv("ARK_API_KEY")
+            or os.getenv("VOLCENGINE_API_KEY")
+            or os.getenv("VOLCENGINE_SPEECH_API_KEY")
+            or os.getenv("API_KEY")
+        )
+        resolved_model = model or os.getenv("ARK_ASR_MODEL") or os.getenv("ARK_MODEL") or os.getenv("VOLCENGINE_ASR_MODEL") or DEFAULT_ARK_MODEL
+        resolved_base_url = api_base_url or os.getenv("ARK_BASE_URL") or os.getenv("VOLCENGINE_BASE_URL") or DEFAULT_ARK_BASE_URL
+        resolved_resource_id = os.getenv("VOLCENGINE_RESOURCE_ID") or DEFAULT_VOLCENGINE_RESOURCE_ID
+    else:
+        resolved_provider = "dashscope"
+        resolved_api_key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("API_KEY")
+        resolved_model = model or os.getenv("DASHSCOPE_ASR_MODEL") or os.getenv("DASHSCOPE_MODEL") or DEFAULT_DASHSCOPE_MODEL
+        resolved_base_url = api_base_url
+        resolved_resource_id = None
+
+    return {
+        "provider": resolved_provider,
+        "api_key": resolved_api_key,
+        "model": resolved_model,
+        "api_base_url": resolved_base_url,
+        "resource_id": resolved_resource_id,
+    }
 
 
 @mcp.tool()
 def get_douyin_download_link(share_link: str) -> str:
-    """
-    获取抖音视频的无水印下载链接
-    
-    参数:
-    - share_link: 抖音分享链接或包含链接的文本
-    
-    返回:
-    - 包含下载链接和视频信息的JSON字符串
-    """
+    """获取抖音视频的无水印下载链接。"""
     try:
-        processor = DouyinProcessor("")  # 获取下载链接不需要API密钥
+        processor = DouyinProcessor()
         video_info = processor.parse_share_url(share_link)
-        
-        return json.dumps({
-            "status": "success",
-            "video_id": video_info["video_id"],
-            "title": video_info["title"],
-            "download_url": video_info["url"],
-            "description": f"视频标题: {video_info['title']}",
-            "usage_tip": "可以直接使用此链接下载无水印视频"
-        }, ensure_ascii=False, indent=2)
-        
+        return json.dumps(
+            {
+                "status": "success",
+                "video_id": video_info["video_id"],
+                "title": video_info["title"],
+                "download_url": video_info["url"],
+                "description": f"视频标题: {video_info['title']}",
+                "usage_tip": "可以直接使用此链接下载无水印视频",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "error": f"获取下载链接失败: {str(e)}"
-        }, ensure_ascii=False, indent=2)
+        return json.dumps({"status": "error", "error": f"获取下载链接失败: {str(e)}"}, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
 async def extract_douyin_text(
     share_link: str,
     model: Optional[str] = None,
-    ctx: Context = None
+    provider: Optional[str] = None,
+    api_base_url: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """
-    从抖音分享链接提取视频中的文本内容
-    
+    从抖音分享链接提取视频中的文本内容。
+
     参数:
     - share_link: 抖音分享链接或包含链接的文本
-    - model: 语音识别模型（可选，默认使用paraformer-v2）
-    
-    返回:
-    - 提取的文本内容
-    
-    注意: 需要设置环境变量 API_KEY
+    - model: 语音识别模型（可选）
+    - provider: ASR 提供方，可选 dashscope / volcengine
+    - api_base_url: 自定义 API Base URL（主要用于火山引擎 / 方舟兼容网关）
     """
     try:
-        # 从环境变量获取API密钥
-        api_key = os.getenv('API_KEY')
-        if not api_key:
-            raise ValueError("未设置环境变量 API_KEY，请在配置中添加阿里云百炼API密钥")
-        
-        processor = DouyinProcessor(api_key, model)
-        
-        # 解析视频链接
-        ctx.info("正在解析抖音分享链接...")
+        config = resolve_runtime_config(provider, model, api_base_url)
+        if not config["api_key"]:
+            if config["provider"] == "volcengine":
+                raise ValueError("未设置火山引擎 / 方舟 API Key，请配置 ARK_API_KEY 或 VOLCENGINE_API_KEY")
+            raise ValueError("未设置 DashScope API Key，请配置 DASHSCOPE_API_KEY 或兼容的 API_KEY")
+
+        processor = DouyinProcessor(**config)
+
+        if ctx:
+            ctx.info("正在解析抖音分享链接...")
         video_info = processor.parse_share_url(share_link)
-        
-        # 直接使用视频URL进行文本提取
-        ctx.info("正在从视频中提取文本...")
-        text_content = processor.extract_text_from_video_url(video_info['url'])
-        
-        ctx.info("文本提取完成!")
+
+        if ctx:
+            ctx.info(f"正在使用 {config['provider']} 提取文本...")
+        text_content = processor.extract_text_from_video_url(video_info["url"])
+
+        if ctx:
+            ctx.info("文本提取完成!")
         return text_content
-        
     except Exception as e:
-        ctx.error(f"处理过程中出现错误: {str(e)}")
+        if ctx:
+            ctx.error(f"处理过程中出现错误: {str(e)}")
         raise Exception(f"提取抖音视频文本失败: {str(e)}")
 
 
 @mcp.tool()
 def parse_douyin_video_info(share_link: str) -> str:
-    """
-    解析抖音分享链接，获取视频基本信息
-    
-    参数:
-    - share_link: 抖音分享链接或包含链接的文本
-    
-    返回:
-    - 视频信息（JSON格式字符串）
-    """
+    """解析抖音分享链接，获取视频基本信息。"""
     try:
-        processor = DouyinProcessor("")  # 不需要API密钥来解析链接
+        processor = DouyinProcessor()
         video_info = processor.parse_share_url(share_link)
-        
-        return json.dumps({
-            "video_id": video_info["video_id"],
-            "title": video_info["title"],
-            "download_url": video_info["url"],
-            "status": "success"
-        }, ensure_ascii=False, indent=2)
-        
+        return json.dumps(
+            {
+                "video_id": video_info["video_id"],
+                "title": video_info["title"],
+                "download_url": video_info["url"],
+                "status": "success",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "error": str(e)
-        }, ensure_ascii=False, indent=2)
+        return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False, indent=2)
 
 
 @mcp.resource("douyin://video/{video_id}")
 def get_video_info(video_id: str) -> str:
-    """
-    获取指定视频ID的详细信息
-    
-    参数:
-    - video_id: 抖音视频ID
-    
-    返回:
-    - 视频详细信息
-    """
+    """获取指定视频ID的详细信息。"""
     share_url = f"https://www.iesdouyin.com/share/video/{video_id}"
     try:
-        processor = DouyinProcessor("")
+        processor = DouyinProcessor()
         video_info = processor.parse_share_url(share_url)
         return json.dumps(video_info, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -320,52 +344,72 @@ def get_video_info(video_id: str) -> str:
 @mcp.prompt()
 def douyin_text_extraction_guide() -> str:
     """抖音视频文本提取使用指南"""
-    return """
+    return f"""
 # 抖音视频文本提取使用指南
 
-## 功能说明
-这个MCP服务器可以从抖音分享链接中提取视频的文本内容，以及获取无水印下载链接。
+## 支持的 ASR Provider
+- `dashscope`（默认）
+- `volcengine`（火山引擎 / 豆包语音 API Key + 大模型录音文件识别接口）
 
 ## 环境变量配置
-请确保设置了以下环境变量：
-- `API_KEY`: 阿里云百炼API密钥
+### DashScope
+- `ASR_PROVIDER=dashscope`（可省略）
+- `DASHSCOPE_API_KEY` 或 `API_KEY`
+- `DASHSCOPE_ASR_MODEL`（默认 `{DEFAULT_DASHSCOPE_MODEL}`）
 
-## 使用步骤
-1. 复制抖音视频的分享链接
-2. 在Claude Desktop配置中设置环境变量 API_KEY
-3. 使用相应的工具进行操作
-
-## 工具说明
-- `extract_douyin_text`: 完整的文本提取流程（需要API密钥）
-- `get_douyin_download_link`: 获取无水印视频下载链接（无需API密钥）
-- `parse_douyin_video_info`: 仅解析视频基本信息
-- `douyin://video/{video_id}`: 获取指定视频的详细信息
+### 火山引擎 / 火山方舟
+- `ASR_PROVIDER=volcengine`
+- `ARK_API_KEY` / `VOLCENGINE_API_KEY` / `VOLCENGINE_SPEECH_API_KEY`（实际作为 `x-api-key` 发送）
+- `ARK_BASE_URL`（默认 `{DEFAULT_ARK_BASE_URL}`）
+- `VOLCENGINE_RESOURCE_ID`（默认 `{DEFAULT_VOLCENGINE_RESOURCE_ID}`）
+- `ARK_ASR_MODEL` / `ARK_MODEL`（默认 `{DEFAULT_ARK_MODEL}`，通常保持 `bigmodel`）
 
 ## Claude Desktop 配置示例
+### DashScope
 ```json
-{
-  "mcpServers": {
-    "douyin-mcp": {
+{{
+  "mcpServers": {{
+    "douyin-mcp": {{
       "command": "uvx",
       "args": ["douyin-mcp-server"],
-      "env": {
-        "API_KEY": "your-api-key-here"
-      }
-    }
-  }
-}
+      "env": {{
+        "ASR_PROVIDER": "dashscope",
+        "DASHSCOPE_API_KEY": "your-dashscope-key"
+      }}
+    }}
+  }}
+}}
 ```
 
-## 注意事项
-- 需要提供有效的阿里云百炼API密钥（通过环境变量）
-- 使用阿里云百炼的paraformer-v2模型进行语音识别
-- 支持大部分抖音视频格式
-- 获取下载链接无需API密钥
+### 火山引擎 / 火山方舟
+```json
+{{
+  "mcpServers": {{
+    "douyin-mcp": {{
+      "command": "uvx",
+      "args": ["douyin-mcp-server"],
+      "env": {{
+        "ASR_PROVIDER": "volcengine",
+        "ARK_API_KEY": "your-volcengine-api-key",
+        "ARK_BASE_URL": "{DEFAULT_ARK_BASE_URL}",
+        "VOLCENGINE_RESOURCE_ID": "{DEFAULT_VOLCENGINE_RESOURCE_ID}",
+        "ARK_ASR_MODEL": "{DEFAULT_ARK_MODEL}"
+      }}
+    }}
+  }}
+}}
+```
+
+## 工具说明
+- `extract_douyin_text`: 完整文本提取流程（需要配置 ASR 提供方）
+- `get_douyin_download_link`: 获取无水印视频下载链接（无需 API 密钥）
+- `parse_douyin_video_info`: 仅解析视频基本信息
+- `douyin://video/{{video_id}}`: 获取指定视频的详细信息
 """
 
 
 def main():
-    """启动MCP服务器"""
+    """启动 MCP 服务器"""
     mcp.run()
 
 
